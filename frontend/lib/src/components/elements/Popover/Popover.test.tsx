@@ -1,0 +1,665 @@
+/**
+ * Copyright (c) Streamlit Inc. (2018-2022) Snowflake Inc. (2022-2026)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+import { screen } from "@testing-library/react"
+import { userEvent } from "@testing-library/user-event"
+
+import { Block as BlockProto } from "@streamlit/protobuf"
+
+import { render } from "~lib/test_util"
+import { WidgetStateManager } from "~lib/WidgetStateManager"
+
+import Popover, { PopoverProps } from "./Popover"
+
+const createWidgetMgr = (): WidgetStateManager =>
+  new WidgetStateManager({
+    sendRerunBackMsg: vi.fn(),
+    formsDataChanged: vi.fn(),
+  })
+
+const getProps = (
+  elementProps: Partial<BlockProto.Popover> = {},
+  props: Partial<PopoverProps> = {}
+): PopoverProps => ({
+  element: BlockProto.Popover.create({
+    label: "label",
+    disabled: false,
+    help: "",
+    ...elementProps,
+  }),
+  empty: false,
+  stretchWidth: false,
+  widgetMgr: createWidgetMgr(),
+  ...props,
+})
+
+describe("Popover container", () => {
+  it("renders without crashing", () => {
+    const props = getProps()
+    render(
+      <Popover {...props}>
+        <div>test</div>
+      </Popover>
+    )
+    const popoverButton = screen.getByTestId("stPopover")
+    expect(popoverButton).toBeInTheDocument()
+    expect(popoverButton).toHaveClass("stPopover")
+  })
+
+  it("renders label on the popover", () => {
+    const props = getProps()
+    render(
+      <Popover {...props}>
+        <div>test</div>
+      </Popover>
+    )
+
+    expect(screen.getByText(props.element.label)).toBeVisible()
+  })
+
+  it("should render the text when opened", async () => {
+    const user = userEvent.setup()
+    const props = getProps()
+    render(
+      <Popover {...props}>
+        <div>test</div>
+      </Popover>
+    )
+
+    await user.click(screen.getByText("label"))
+    // Text should be visible now
+    expect(screen.queryByText("test")).toBeVisible()
+  })
+
+  it("closes when clicking outside the popover", async () => {
+    const user = userEvent.setup()
+    const props = getProps()
+    render(
+      <div>
+        <button type="button">outside</button>
+        <Popover {...props}>
+          <div>test</div>
+        </Popover>
+      </div>
+    )
+
+    await user.click(screen.getByText("label"))
+    expect(screen.queryByText("test")).toBeVisible()
+
+    // Wait past the "just opened" guard that ignores the opening click.
+    await new Promise(resolve => setTimeout(resolve, 60))
+
+    await user.click(screen.getByText("outside"))
+    expect(screen.queryByText("test")).not.toBeInTheDocument()
+  })
+
+  it("stays open when interacting with a Streamlit overlay root", async () => {
+    // A widget inside the popover (e.g. multiselect) renders its dropdown in a
+    // shared overlay host portalled outside the popover body. Clicking it must
+    // not dismiss the popover. Regression test for
+    // https://github.com/streamlit/streamlit/issues/15959.
+    const user = userEvent.setup()
+    const props = getProps()
+
+    const overlayHost = document.createElement("div")
+    overlayHost.setAttribute("data-st-overlay-root", "true")
+    const overlayOption = document.createElement("button")
+    overlayOption.textContent = "dropdown option"
+    overlayHost.appendChild(overlayOption)
+    document.body.appendChild(overlayHost)
+
+    try {
+      render(
+        <Popover {...props}>
+          <div>test</div>
+        </Popover>
+      )
+
+      await user.click(screen.getByText("label"))
+      expect(screen.queryByText("test")).toBeVisible()
+
+      // Wait past the "just opened" guard so this click is treated as a real
+      // outside interaction (which would otherwise close the popover).
+      await new Promise(resolve => setTimeout(resolve, 60))
+
+      await user.click(screen.getByText("dropdown option"))
+      // The popover must remain open after interacting with the overlay root.
+      expect(screen.queryByText("test")).toBeVisible()
+    } finally {
+      document.body.removeChild(overlayHost)
+    }
+  })
+
+  it("stays open when a close-on-select overlay detaches the clicked node", async () => {
+    // Some overlays (date picker calendar, single-select dropdown) close
+    // synchronously on selection, detaching the clicked node before the
+    // document click handler runs. Capturing the target on pointerdown keeps
+    // the popover open. Regression test for
+    // https://github.com/streamlit/streamlit/issues/15959.
+    const user = userEvent.setup()
+    const props = getProps()
+
+    const overlayHost = document.createElement("div")
+    overlayHost.setAttribute("data-st-overlay-root", "true")
+    const overlayOption = document.createElement("button")
+    overlayOption.textContent = "day 15"
+    overlayHost.appendChild(overlayOption)
+    document.body.appendChild(overlayHost)
+    // Simulate the overlay detaching the clicked node on selection.
+    overlayOption.addEventListener("click", () => overlayHost.remove())
+
+    try {
+      render(
+        <Popover {...props}>
+          <div>test</div>
+        </Popover>
+      )
+
+      await user.click(screen.getByText("label"))
+      expect(screen.queryByText("test")).toBeVisible()
+
+      await new Promise(resolve => setTimeout(resolve, 60))
+
+      await user.click(screen.getByText("day 15"))
+      // pointerdown captured the click as inside an overlay root before the
+      // node detached, so the popover stays open.
+      expect(screen.queryByText("test")).toBeVisible()
+    } finally {
+      if (overlayHost.parentNode) {
+        document.body.removeChild(overlayHost)
+      }
+    }
+  })
+
+  it("stays open when a keyboard-activated overlay option detaches before click", async () => {
+    // Enter/Space on an overlay option can dispatch a `click` with no preceding
+    // pointerdown, and a close-on-select overlay may detach the option first —
+    // orphaning the click target. Recording the origin on the Enter keydown
+    // (capture phase) keeps the popover open. Regression test for
+    // https://github.com/streamlit/streamlit/issues/15959.
+    const user = userEvent.setup()
+    const props = getProps()
+
+    const overlayHost = document.createElement("div")
+    overlayHost.setAttribute("data-st-overlay-root", "true")
+    const overlayOption = document.createElement("button")
+    overlayOption.textContent = "day 15"
+    overlayHost.appendChild(overlayOption)
+    document.body.appendChild(overlayHost)
+
+    try {
+      render(
+        <Popover {...props}>
+          <div>test</div>
+        </Popover>
+      )
+
+      await user.click(screen.getByText("label"))
+      expect(screen.queryByText("test")).toBeVisible()
+
+      await new Promise(resolve => setTimeout(resolve, 60))
+
+      // Enter keydown inside the overlay records the interaction origin before
+      // the overlay detaches the option node...
+      overlayOption.dispatchEvent(
+        new KeyboardEvent("keydown", { key: "Enter", bubbles: true })
+      )
+      overlayHost.remove()
+      // ...so the follow-up click with an orphaned target does not dismiss.
+      document.dispatchEvent(new MouseEvent("click", { bubbles: true }))
+      expect(screen.queryByText("test")).toBeVisible()
+    } finally {
+      if (overlayHost.parentNode) {
+        document.body.removeChild(overlayHost)
+      }
+    }
+  })
+
+  it("tags the popover body as an overlay root", async () => {
+    // The body is marked data-st-overlay-root so a nested inner popover (whose
+    // body is portalled outside the outer popover) doesn't dismiss the outer
+    // popover. Regression test for
+    // https://github.com/streamlit/streamlit/issues/15959.
+    const user = userEvent.setup()
+    const props = getProps()
+    render(
+      <Popover {...props}>
+        <div>test</div>
+      </Popover>
+    )
+
+    await user.click(screen.getByText("label"))
+    expect(screen.getByTestId("stPopoverBody")).toHaveAttribute(
+      "data-st-overlay-root",
+      "true"
+    )
+  })
+
+  it("should render correctly with width=stretch and help", async () => {
+    const user = userEvent.setup()
+    // Hover to see tooltip content
+    render(
+      <Popover
+        {...getProps({ help: "mockHelpText" }, { stretchWidth: true })}
+      />
+    )
+
+    // Ensure both the button and the tooltip target have the correct width
+    const popoverButtonWidget = screen.getByRole("button")
+    expect(popoverButtonWidget).toHaveStyle("width: 100%")
+    const tooltipTarget = screen.getByTestId("stTooltipHoverTarget")
+    expect(tooltipTarget).toHaveStyle("width: 100%")
+
+    // Ensure the tooltip content is visible and has the correct text
+    await user.hover(tooltipTarget)
+
+    const tooltipContent = await screen.findByTestId("stTooltipContent")
+    expect(tooltipContent).toHaveTextContent("mockHelpText")
+  })
+
+  it("should render correctly with help", async () => {
+    const user = userEvent.setup()
+    // Hover to see tooltip content
+    render(<Popover {...getProps({ help: "mockHelpText" })} />)
+
+    // Ensure both the button and the tooltip target have the correct width
+    const popoverButtonWidget = screen.getByRole("button")
+    // The button should stretch to the container and width will
+    // be set on the Element Container.
+    expect(popoverButtonWidget).toHaveStyle("width: 100%")
+    const tooltipTarget = screen.getByTestId("stTooltipHoverTarget")
+    expect(tooltipTarget).toHaveStyle("width: 100%")
+
+    // Ensure the tooltip content is visible and has the correct text
+    await user.hover(tooltipTarget)
+
+    const tooltipContent = await screen.findByTestId("stTooltipContent")
+    expect(tooltipContent).toHaveTextContent("mockHelpText")
+  })
+
+  it("passes width=stretch property without help correctly", () => {
+    render(<Popover {...getProps({}, { stretchWidth: true })} />)
+
+    const popoverButtonWidget = screen.getByRole("button")
+    expect(popoverButtonWidget).toHaveStyle("width: 100%")
+  })
+})
+
+describe("Dynamic popover (widget mode)", () => {
+  it("calls widgetMgr.setBoolValue on toggle for widget popovers", async () => {
+    const user = userEvent.setup()
+    const widgetMgr = createWidgetMgr()
+    const setBoolValueSpy = vi.spyOn(widgetMgr, "setBoolValue")
+
+    const widgetId = "popover-widget-id"
+    const fragmentId = "frag-1"
+    const props = getProps({ id: widgetId }, { widgetMgr, fragmentId })
+
+    render(
+      <Popover {...props}>
+        <div>content</div>
+      </Popover>
+    )
+
+    await user.click(screen.getByText("label"))
+
+    expect(setBoolValueSpy).toHaveBeenCalledWith(
+      { id: widgetId },
+      true,
+      { fromUi: true },
+      fragmentId
+    )
+  })
+
+  it("does NOT call widgetMgr.setBoolValue for non-widget popovers", async () => {
+    const user = userEvent.setup()
+    const widgetMgr = createWidgetMgr()
+    const setBoolValueSpy = vi.spyOn(widgetMgr, "setBoolValue")
+
+    const props = getProps({}, { widgetMgr })
+
+    render(
+      <Popover {...props}>
+        <div>content</div>
+      </Popover>
+    )
+
+    await user.click(screen.getByText("label"))
+
+    expect(setBoolValueSpy).not.toHaveBeenCalled()
+  })
+
+  it("sends false when closing a widget popover", async () => {
+    const user = userEvent.setup()
+    const widgetMgr = createWidgetMgr()
+    const setBoolValueSpy = vi.spyOn(widgetMgr, "setBoolValue")
+
+    const widgetId = "popover-widget-id"
+    const fragmentId = "frag-1"
+    const props = getProps({ id: widgetId }, { widgetMgr, fragmentId })
+
+    render(
+      <Popover {...props}>
+        <div>content</div>
+      </Popover>
+    )
+
+    await user.click(screen.getByText("label"))
+    expect(setBoolValueSpy).toHaveBeenLastCalledWith(
+      { id: widgetId },
+      true,
+      { fromUi: true },
+      fragmentId
+    )
+
+    await user.click(screen.getByText("label"))
+    expect(setBoolValueSpy).toHaveBeenLastCalledWith(
+      { id: widgetId },
+      false,
+      { fromUi: true },
+      fragmentId
+    )
+  })
+
+  it("does NOT sync element.open for non-widget popovers", () => {
+    const widgetMgr = createWidgetMgr()
+    const setBoolValueSpy = vi.spyOn(widgetMgr, "setBoolValue")
+
+    const props = getProps({ open: false }, { widgetMgr })
+
+    const { rerender } = render(
+      <Popover {...props}>
+        <div>content</div>
+      </Popover>
+    )
+
+    const button = screen.getByRole("button")
+    expect(button).toHaveAttribute("aria-expanded", "false")
+
+    const updatedProps = getProps({ open: true }, { widgetMgr })
+
+    rerender(
+      <Popover {...updatedProps}>
+        <div>content</div>
+      </Popover>
+    )
+
+    expect(button).toHaveAttribute("aria-expanded", "false")
+    expect(setBoolValueSpy).not.toHaveBeenCalled()
+  })
+
+  it("syncs open state when element.open changes programmatically", () => {
+    const widgetMgr = createWidgetMgr()
+    const setBoolValueSpy = vi.spyOn(widgetMgr, "setBoolValue")
+
+    const widgetId = "popover-widget-id"
+    const fragmentId = "frag-1"
+    const props = getProps(
+      { open: false, id: widgetId },
+      { widgetMgr, fragmentId }
+    )
+
+    const { rerender } = render(
+      <Popover {...props}>
+        <div>content</div>
+      </Popover>
+    )
+
+    const button = screen.getByRole("button")
+    expect(button).toHaveAttribute("aria-expanded", "false")
+
+    const updatedProps = getProps(
+      { open: true, id: widgetId },
+      { widgetMgr, fragmentId }
+    )
+
+    rerender(
+      <Popover {...updatedProps}>
+        <div>content</div>
+      </Popover>
+    )
+
+    expect(button).toHaveAttribute("aria-expanded", "true")
+    // The widget manager state should also be updated (with fromUi: false
+    // to avoid triggering a rerun) so that subsequent reruns send the
+    // correct value back to the backend.
+    expect(setBoolValueSpy).toHaveBeenCalledWith(
+      { id: widgetId },
+      true,
+      { fromUi: false },
+      fragmentId
+    )
+  })
+
+  it("syncs widget manager state on programmatic close to prevent stale reopens", () => {
+    const widgetMgr = createWidgetMgr()
+    const setBoolValueSpy = vi.spyOn(widgetMgr, "setBoolValue")
+
+    const widgetId = "popover-widget-id"
+    const fragmentId = "frag-1"
+
+    // Start with the popover open (simulating it was opened by the user)
+    const props = getProps(
+      { open: true, id: widgetId },
+      { widgetMgr, fragmentId }
+    )
+
+    const { rerender } = render(
+      <Popover {...props}>
+        <div>content</div>
+      </Popover>
+    )
+
+    const button = screen.getByTestId("stPopoverButton")
+    expect(button).toHaveAttribute("aria-expanded", "true")
+
+    // Backend programmatically closes the popover (e.g. st.session_state.key = False)
+    const closedProps = getProps(
+      { open: false, id: widgetId },
+      { widgetMgr, fragmentId }
+    )
+
+    rerender(
+      <Popover {...closedProps}>
+        <div>content</div>
+      </Popover>
+    )
+
+    expect(button).toHaveAttribute("aria-expanded", "false")
+    // The widget manager must be updated with false so that the next rerun
+    // (triggered by e.g. another popover) does not send stale "true" back.
+    expect(setBoolValueSpy).toHaveBeenCalledWith(
+      { id: widgetId },
+      false,
+      { fromUi: false },
+      fragmentId
+    )
+  })
+})
+
+describe("passive state persistence", () => {
+  it("restores open state from elementStates on mount", () => {
+    const blockId = "$$ID-abc123-my_popover"
+    const widgetMgr = createWidgetMgr()
+
+    widgetMgr.setElementState(blockId, "open", true)
+
+    const props = getProps({}, { widgetMgr, blockId })
+
+    render(
+      <Popover {...props}>
+        <div>popover content</div>
+      </Popover>
+    )
+
+    // Stored state (true) overrides proto default (false)
+    expect(screen.getByTestId("stPopoverButton")).toHaveAttribute(
+      "aria-expanded",
+      "true"
+    )
+  })
+
+  it("uses proto default when no stored state exists", () => {
+    const blockId = "$$ID-abc123-my_popover"
+    const widgetMgr = createWidgetMgr()
+
+    const props = getProps({}, { widgetMgr, blockId })
+
+    render(
+      <Popover {...props}>
+        <div>popover content</div>
+      </Popover>
+    )
+
+    expect(screen.getByRole("button")).toHaveAttribute(
+      "aria-expanded",
+      "false"
+    )
+  })
+
+  it("persists open state on toggle", async () => {
+    const user = userEvent.setup()
+    const blockId = "$$ID-abc123-my_popover"
+    const widgetMgr = createWidgetMgr()
+
+    const props = getProps({}, { widgetMgr, blockId })
+
+    render(
+      <Popover {...props}>
+        <div>popover content</div>
+      </Popover>
+    )
+
+    await user.click(screen.getByText("label"))
+
+    expect(widgetMgr.getElementState(blockId, "open")).toBe(true)
+  })
+
+  it("does NOT persist state when no blockId is set", async () => {
+    const user = userEvent.setup()
+    const widgetMgr = createWidgetMgr()
+
+    const props = getProps({}, { widgetMgr })
+
+    render(
+      <Popover {...props}>
+        <div>popover content</div>
+      </Popover>
+    )
+
+    await user.click(screen.getByText("label"))
+
+    // No blockId → toggled state (true) should NOT have been stored
+    expect(widgetMgr.getElementState("", "open")).not.toBe(true)
+  })
+
+  it("does NOT persist state for widget-mode popovers", async () => {
+    const user = userEvent.setup()
+    const blockId = "$$ID-abc123-my_popover"
+    const widgetMgr = createWidgetMgr()
+
+    const props = getProps({ id: "widget-123" }, { widgetMgr, blockId })
+
+    render(
+      <Popover {...props}>
+        <div>popover content</div>
+      </Popover>
+    )
+
+    await user.click(screen.getByText("label"))
+
+    // Widget mode: persistence should not write open state
+    expect(widgetMgr.getElementState(blockId, "open")).toBeUndefined()
+  })
+
+  it("uses server state even when elementStates has a stale value (widget mode)", () => {
+    const blockId = "$$ID-abc123-my_popover"
+    const widgetMgr = createWidgetMgr()
+
+    // Pre-populate elementStates with stale "open = true"
+    widgetMgr.setElementState(blockId, "open", true)
+
+    // Widget mode (element.id set → on_change="rerun"): server says closed
+    const props = getProps(
+      { open: false, id: "widget-123" },
+      { widgetMgr, blockId }
+    )
+
+    render(
+      <Popover {...props}>
+        <div>popover content</div>
+      </Popover>
+    )
+
+    // Server value should win — popover should be closed
+    expect(screen.getByRole("button")).toHaveAttribute(
+      "aria-expanded",
+      "false"
+    )
+  })
+})
+
+describe("Popover chevron visibility", () => {
+  it.each([
+    ":material/menu:",
+    ":material/more_vert:",
+    ":material/more_horiz:",
+  ])("hides chevron when label is menu-style icon %s", async label => {
+    const user = userEvent.setup()
+    const props = getProps({ label })
+    render(
+      <Popover {...props}>
+        <div>content</div>
+      </Popover>
+    )
+
+    const button = screen.getByTestId("stPopoverButton")
+
+    // Chevron should not be present when closed
+    expect(button).not.toHaveTextContent("expand_more")
+
+    // Open popover and check chevron is still not shown
+    await user.click(button)
+    expect(button).not.toHaveTextContent("expand_less")
+  })
+
+  it("shows chevron for regular labels", () => {
+    const props = getProps({ label: "Actions" })
+    render(
+      <Popover {...props}>
+        <div>content</div>
+      </Popover>
+    )
+
+    const button = screen.getByTestId("stPopoverButton")
+    expect(button).toHaveTextContent("expand_more")
+  })
+
+  it("shows chevron when label is menu icon but icon prop is also set", () => {
+    const props = getProps({
+      label: ":material/menu:",
+      icon: ":material/edit:",
+    })
+    render(
+      <Popover {...props}>
+        <div>content</div>
+      </Popover>
+    )
+
+    const button = screen.getByTestId("stPopoverButton")
+    expect(button).toHaveTextContent("expand_more")
+  })
+})
