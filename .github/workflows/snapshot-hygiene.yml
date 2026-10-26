@@ -1,0 +1,229 @@
+name: Snapshot Hygiene Check
+
+on:
+  push:
+    branches:
+      - "develop"
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - "e2e_playwright/**"
+      - "scripts/snapshot_cleanup.py"
+
+  # Allows workflow to be called from other workflows
+  workflow_call:
+    inputs:
+      ref:
+        required: true
+        type: string
+
+# Avoid duplicate workflows on same branch
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-snapshot-hygiene
+  cancel-in-progress: true
+
+env:
+  FORCE_COLOR: "1"
+
+jobs:
+  check-orphaned-snapshots:
+    name: Check for orphaned snapshots
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    permissions:
+      contents: read
+      pull-requests: write
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout Streamlit code
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+          submodules: "recursive"
+          fetch-depth: 2
+
+      - name: Set Python version vars
+        id: build_info
+        uses: ./.github/actions/build_info
+
+      - name: Setup virtual env
+        uses: ./.github/actions/make_init
+        with:
+          python_version: ${{ env.PYTHON_MAX_VERSION }}
+
+      - name: Check for orphaned snapshots
+        id: check-snapshots
+        run: |
+          # Do not let a failing check abort the step before we have captured
+          # and forwarded the diagnostic output to the following steps.
+          set +e
+          set -o pipefail
+
+          uv run python scripts/snapshot_cleanup.py --ci 2>&1 | tee snapshot-hygiene-output.txt
+          exit_code=${PIPESTATUS[0]}
+
+          set -e
+
+          echo "exit_code=${exit_code}" >> "$GITHUB_OUTPUT"
+          {
+            echo "output<<SNAPSHOT_HYGIENE_OUTPUT_EOF"
+            cat snapshot-hygiene-output.txt
+            echo "SNAPSHOT_HYGIENE_OUTPUT_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+          if [ "${exit_code}" -ne 0 ]; then
+            # A non-zero exit means the hygiene check failed. We deliberately
+            # do not distinguish orphaned snapshots from script failures here:
+            # both fail the job and both should trigger the warning comment.
+            echo "found_orphaned_snapshots=true" >> "$GITHUB_OUTPUT"
+            exit "${exit_code}"
+          fi
+
+          echo "found_orphaned_snapshots=false" >> "$GITHUB_OUTPUT"
+
+      # On a clean run, remove any stale warning comment left by an earlier run.
+      # This only runs when every previous step (including the check) succeeded.
+      - name: Delete existing snapshot hygiene comment
+        if: success() && github.event_name == 'pull_request'
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          SNAPSHOT_HYGIENE_MARKER: "<!-- snapshot-hygiene-check -->"
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const marker = process.env.SNAPSHOT_HYGIENE_MARKER;
+
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              per_page: 100,
+            });
+
+            const matchingComments = comments.filter(
+              (comment) =>
+                comment.user?.type === "Bot" &&
+                typeof comment.body === "string" &&
+                comment.body.includes(marker)
+            );
+
+            for (const comment of matchingComments) {
+              await github.rest.issues.deleteComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: comment.id,
+              });
+              core.info(`Deleted snapshot hygiene comment ${comment.id}.`);
+            }
+
+            core.info(
+              `Deleted ${matchingComments.length} snapshot hygiene comment(s).`
+            );
+
+      # If anything up to this point failed (including preparation steps or the
+      # deletion of an old comment), still try to publish/update the warning
+      # comment. The check output may be empty, in which case the summary is
+      # simply omitted from the comment.
+      - name: Create or update orphaned snapshot warning comment
+        if: failure() && github.event_name == 'pull_request'
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          SNAPSHOT_HYGIENE_MARKER: "<!-- snapshot-hygiene-check -->"
+          CHECK_OUTPUT: ${{ steps.check-snapshots.outputs.output }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const marker = process.env.SNAPSHOT_HYGIENE_MARKER;
+            const rawOutput = process.env.CHECK_OUTPUT || "";
+
+            const extractSection = (text, startMarker, endMarker) => {
+              const start = text.indexOf(startMarker);
+              if (start === -1) {
+                return "";
+              }
+
+              const contentStart = start + startMarker.length;
+              const end = text.indexOf(endMarker, contentStart);
+              return (end === -1 ? text.slice(contentStart) : text.slice(contentStart, end)).trim();
+            };
+
+            const summary = extractSection(
+              rawOutput,
+              "Orphaned snapshots by test:",
+              "--- COPY_PASTE_START ---"
+            );
+            const snapshotFiles = extractSection(
+              rawOutput,
+              "--- COPY_PASTE_START ---",
+              "--- COPY_PASTE_END ---"
+            );
+
+            const body = [
+              marker,
+              "## ⚠️ Orphaned E2E snapshots detected",
+              "",
+              "The snapshot hygiene check failed. This can mean that orphaned snapshots were found, or that the snapshot check script itself could not complete. See the [workflow run](" +
+                `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}` +
+                ") for the full log.",
+              "",
+              "### Summary by test",
+              "",
+              summary
+                ? ["```text", summary, "```"].join("\n")
+                : "_No summary was available from the check output._",
+              "",
+              "### Snapshot files",
+              "",
+              snapshotFiles
+                ? ["```text", snapshotFiles, "```"].join("\n")
+                : "_No snapshot file list was available from the check output._",
+              "",
+              "### How to fix",
+              "",
+              "1. **Clean up locally:** run `uv run python scripts/snapshot_cleanup.py` from the repository root, then review the reported files before committing the deletions.",
+              "2. **Verify manually:** confirm each reported snapshot is really unused. The static analysis is best-effort and can report false positives, especially for dynamically generated snapshot names.",
+              "3. **Exclude false positives:** if a snapshot is still used, add its filename to `DISALLOWED_SNAPSHOTS` in `scripts/snapshot_cleanup.py` so future checks ignore it.",
+              "4. **Commit the fix:** commit the deleted snapshots and/or the updated disallow list, then push the change to this pull request.",
+              "",
+              "> This workflow only reports findings. It never deletes snapshots or commits fixes automatically.",
+            ].join("\n");
+
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              per_page: 100,
+            });
+
+            const matchingComments = comments.filter(
+              (comment) =>
+                comment.user?.type === "Bot" &&
+                typeof comment.body === "string" &&
+                comment.body.includes(marker)
+            );
+
+            if (matchingComments.length > 0) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: matchingComments[0].id,
+                body,
+              });
+              core.info(
+                `Updated snapshot hygiene comment ${matchingComments[0].id}.`
+              );
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.payload.pull_request.number,
+                body,
+              });
+              core.info("Created a new snapshot hygiene warning comment.");
+            }
