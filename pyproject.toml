@@ -122,7 +122,7 @@ test = [
   "httpx2>=2.7.0",
   # Playwright and E2E test dependencies:
   # We pin playwright to a minor version to avoid new browser versions breaking our CI.
-  "playwright==1.61.*",
+  "playwright>=1.61,<1.65",
   "pytest-playwright>=0.3.3",
   "pixelmatch>=0.3.0",
   "pytest-xdist>=3.6.1",
